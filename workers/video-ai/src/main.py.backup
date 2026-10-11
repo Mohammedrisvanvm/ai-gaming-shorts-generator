@@ -1,0 +1,524 @@
+from __future__ import annotations
+
+import json
+import math
+import struct
+import statistics
+import math
+import struct
+import statistics
+import os
+import shutil
+import sqlite3
+import subprocess
+import uuid
+from datetime import datetime, timezone
+from fractions import Fraction
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, FileResponse
+import uvicorn
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DATA_DIR = PROJECT_ROOT / "data"
+SOURCES_DIR = (DATA_DIR / "sources").resolve()
+CLIPS_DIR = (DATA_DIR / "clips").resolve()
+CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "shorts.db"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="AI Gaming Shorts Local Worker", version="0.3.0")
+
+
+def connect_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH, timeout=15)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_db() -> None:
+    with connect_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL,
+                source_url TEXT,
+                source_path TEXT,
+                original_filename TEXT,
+                game TEXT NOT NULL DEFAULT 'EA SPORTS FC',
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                duration_seconds REAL,
+                width INTEGER,
+                height INTEGER,
+                video_codec TEXT,
+                audio_codec TEXT,
+                frame_rate REAL,
+                size_bytes INTEGER,
+                format_name TEXT,
+                error TEXT
+            )
+        """)
+        db.execute("""CREATE TABLE IF NOT EXISTS highlights (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, start_seconds REAL NOT NULL,
+            end_seconds REAL NOT NULL, peak_seconds REAL NOT NULL, score REAL NOT NULL,
+            audio_score REAL NOT NULL, visual_score REAL NOT NULL, reason TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS highlights (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, start_seconds REAL NOT NULL,
+            end_seconds REAL NOT NULL, peak_seconds REAL NOT NULL, score REAL NOT NULL,
+            audio_score REAL NOT NULL, visual_score REAL NOT NULL, reason TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS clips (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, highlight_id TEXT NOT NULL,
+            file_path TEXT NOT NULL, created_at TEXT NOT NULL, start_seconds REAL NOT NULL,
+            end_seconds REAL NOT NULL, width INTEGER NOT NULL DEFAULT 1080, height INTEGER NOT NULL DEFAULT 1920,
+            FOREIGN KEY(project_id) REFERENCES projects(id), FOREIGN KEY(highlight_id) REFERENCES highlights(id)
+        )""")
+        db.commit()
+
+
+def row_to_project(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def valid_youtube_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in {
+        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be"
+    }
+
+
+class YouTubeProject(BaseModel):
+    source_url: str = Field(min_length=1, max_length=2048)
+
+
+class InspectRequest(BaseModel):
+    file_path: str
+    original_filename: str = Field(min_length=1, max_length=255)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    initialize_db()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "video-ai-worker", "milestone": 3, "game": "EA SPORTS FC"}
+
+
+@app.get("/ready")
+def ready():
+    return {"ready": True, "capabilities": ["local-video-inspection", "sqlite-project-storage", "highlight-candidate-detection", "highlight-candidate-detection"], "ffprobe_available": shutil.which("ffprobe") is not None}
+
+
+@app.post("/projects/youtube", status_code=201)
+def create_youtube_project(payload: YouTubeProject):
+    if not valid_youtube_url(payload.source_url):
+        raise HTTPException(status_code=400, detail="Only HTTPS YouTube URLs are accepted.")
+    project = {
+        "id": str(uuid.uuid4()),
+        "source_type": "youtube_url",
+        "source_url": payload.source_url,
+        "source_path": None,
+        "original_filename": None,
+        "game": "EA SPORTS FC",
+        "status": "awaiting_local_video",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with connect_db() as db:
+        db.execute("INSERT INTO projects (id, source_type, source_url, source_path, original_filename, game, status, created_at) VALUES (:id, :source_type, :source_url, :source_path, :original_filename, :game, :status, :created_at)", project)
+        db.commit()
+    return {"project": project}
+
+
+@app.post("/inspect", status_code=201)
+def inspect_video(payload: InspectRequest):
+    requested_path = Path(payload.file_path).resolve()
+    try:
+        requested_path.relative_to(SOURCES_DIR)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Video path must be inside the local sources directory.")
+    if not requested_path.is_file():
+        raise HTTPException(status_code=404, detail="Uploaded video file was not found.")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise HTTPException(status_code=503, detail="FFprobe was not found. Confirm FFmpeg is installed and restart VS Code.")
+
+    command = [ffprobe, "-v", "error", "-show_entries",
+               "format=duration,size,format_name:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate",
+               "-of", "json", str(requested_path)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=45, check=False)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=422, detail="Video inspection timed out after 45 seconds.")
+    if result.returncode != 0:
+        detail = result.stderr.strip()[-800:] or "FFprobe could not read this file."
+        raise HTTPException(status_code=422, detail=f"Unable to inspect video: {detail}")
+    try:
+        probe = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=422, detail="FFprobe returned invalid metadata.")
+
+    streams = probe.get("streams", [])
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+    if not video_stream:
+        raise HTTPException(status_code=422, detail="The uploaded file does not contain a video stream.")
+    format_data = probe.get("format", {})
+    frame_rate = None
+    rate = video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate")
+    try:
+        parsed_rate = float(Fraction(rate)) if rate and rate != "0/0" else None
+        if parsed_rate and parsed_rate > 0:
+            frame_rate = round(parsed_rate, 3)
+    except (ValueError, ZeroDivisionError):
+        frame_rate = None
+
+    project = {
+        "id": str(uuid.uuid4()),
+        "source_type": "local_file",
+        "source_url": None,
+        "source_path": str(requested_path),
+        "original_filename": payload.original_filename,
+        "game": "EA SPORTS FC",
+        "status": "inspected",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "duration_seconds": float(format_data["duration"]) if format_data.get("duration") else None,
+        "width": video_stream.get("width"),
+        "height": video_stream.get("height"),
+        "video_codec": video_stream.get("codec_name"),
+        "audio_codec": audio_stream.get("codec_name") if audio_stream else None,
+        "frame_rate": frame_rate,
+        "size_bytes": int(format_data.get("size", requested_path.stat().st_size)),
+        "format_name": format_data.get("format_name"),
+        "error": None,
+    }
+    with connect_db() as db:
+        db.execute("""INSERT INTO projects (id, source_type, source_url, source_path, original_filename, game, status, created_at, duration_seconds, width, height, video_codec, audio_codec, frame_rate, size_bytes, format_name, error)
+            VALUES (:id, :source_type, :source_url, :source_path, :original_filename, :game, :status, :created_at, :duration_seconds, :width, :height, :video_codec, :audio_codec, :frame_rate, :size_bytes, :format_name, :error)""", project)
+        db.commit()
+    return {"project": project}
+
+
+@app.get("/projects")
+def list_projects():
+    with connect_db() as db:
+        rows = db.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+    return {"projects": [row_to_project(row) for row in rows]}
+
+
+def _decode_audio(path: Path, duration: float) -> list[float]:
+    """Extract 8kHz mono PCM and compute per-second RMS without extra dependencies."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(503, "FFmpeg is not installed.")
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"]
+    # Limit to 30 minutes to keep memory/CPU bounded on the local worker.
+    cmd[6:6] = ["-t", str(min(duration, 1800))]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(422, "Audio analysis timed out.")
+    if result.returncode != 0 or not result.stdout:
+        return []  # Silent video or unsupported audio: rely on visual signal.
+    data = result.stdout
+    scores = []
+    for offset in range(0, len(data), 16000):
+        chunk = data[offset:offset+16000]
+        count = len(chunk)//2
+        if count < 800: break
+        values = struct.unpack(f"<{count}h", chunk[:count*2])
+        rms = math.sqrt(sum(v*v for v in values)/count) / 32768
+        scores.append(rms)
+    return scores
+
+
+def _visual_changes(path: Path, duration: float) -> list[float]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(503, "FFmpeg is not installed.")
+    # 64x36 grayscale @ 1 fps, capped at 30 minutes. Fast, low-memory frames.
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-t", str(min(duration, 1800)), "-vf", "fps=1,scale=64:36,format=gray",
+           "-an", "-f", "rawvideo", "pipe:1"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(422, "Visual analysis timed out.")
+    if result.returncode != 0:
+        raise HTTPException(422, "Could not decode video frames for analysis.")
+    size = 64*36
+    frames = [result.stdout[i:i+size] for i in range(0, len(result.stdout)-size+1, size)]
+    scores = [0.0]
+    for previous, current in zip(frames, frames[1:]):
+        scores.append(sum(abs(a-b) for a,b in zip(previous,current))/(size*255))
+    return scores
+
+
+def _normalize(values: list[float]) -> list[float]:
+    if not values: return []
+    baseline = statistics.median(values)
+    upper = max(values)
+    if upper <= baseline + 1e-8: return [0.0] * len(values)
+    return [max(0.0, min(1.0, (value-baseline)/(upper-baseline))) for value in values]
+
+
+@app.post("/projects/{project_id}/analyze")
+def analyze_project(project_id: str):
+    with connect_db() as db:
+        row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Project not found.")
+    if row["source_type"] != "local_file":
+        raise HTTPException(400, "Upload an authorized local video before analyzing highlights.")
+    path = Path(row["source_path"] or "").resolve()
+    try:
+        path.relative_to(SOURCES_DIR)
+    except ValueError:
+        raise HTTPException(400, "Invalid project video path.")
+    if not path.is_file():
+        raise HTTPException(404, "The local source video is missing.")
+    duration = float(row["duration_seconds"] or 0)
+    if duration < 3:
+        raise HTTPException(422, "Video must be at least 3 seconds long.")
+    audio = _normalize(_decode_audio(path, duration))
+    visual = _normalize(_visual_changes(path, duration))
+    length = min(math.ceil(duration), 1800, max(len(audio),len(visual)))
+    candidates = []
+    for second in range(2, max(2, length-2)):
+        a = audio[second] if second < len(audio) else 0.0
+        v = visual[second] if second < len(visual) else 0.0
+        score = round(0.65*a + 0.35*v, 4) if audio else round(v, 4)
+        candidates.append((score, second, a, v))
+    candidates.sort(reverse=True)
+    selected = []
+    for score, second, a, v in candidates:
+        if score < 0.12 or any(abs(second - item[1]) < 18 for item in selected):
+            continue
+        selected.append((score, second, a, v))
+        if len(selected) >= 8: break
+    selected.sort(key=lambda item: item[1])
+    highlights = []
+    for score, second, a, v in selected:
+        start = max(0.0, float(second)-9)
+        end = min(duration, float(second)+12)
+        highlights.append({"id": str(uuid.uuid4()), "project_id": project_id,
+            "start_seconds": start, "end_seconds": end, "peak_seconds": float(second),
+            "score": score, "audio_score": round(a,4), "visual_score": round(v,4),
+            "reason": "Audio intensity + visual change" if audio else "Visual change (no audio signal)"})
+    with connect_db() as db:
+        db.execute("DELETE FROM highlights WHERE project_id=?", (project_id,))
+        db.executemany("""INSERT INTO highlights (id, project_id, start_seconds, end_seconds,
+            peak_seconds, score, audio_score, visual_score, reason)
+            VALUES (:id,:project_id,:start_seconds,:end_seconds,:peak_seconds,:score,:audio_score,:visual_score,:reason)""", highlights)
+        db.execute("UPDATE projects SET status='analyzed' WHERE id=?", (project_id,))
+        db.commit()
+    return {"project_id": project_id, "highlights": highlights,
+            "method": "Local audio-energy and frame-change heuristics; not goal recognition.",
+            "analyzed_seconds": min(duration, 1800)}
+
+
+@app.get("/projects/{project_id}/highlights")
+def project_highlights(project_id: str):
+    with connect_db() as db:
+        if db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None:
+            raise HTTPException(404, "Project not found.")
+        rows = db.execute("SELECT * FROM highlights WHERE project_id=? ORDER BY start_seconds", (project_id,)).fetchall()
+    return {"highlights": [dict(row) for row in rows]}
+
+
+def _decode_audio(path: Path, duration: float) -> list[float]:
+    """Extract 8kHz mono PCM and compute per-second RMS without extra dependencies."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(503, "FFmpeg is not installed.")
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"]
+    # Limit to 30 minutes to keep memory/CPU bounded on the local worker.
+    cmd[6:6] = ["-t", str(min(duration, 1800))]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(422, "Audio analysis timed out.")
+    if result.returncode != 0 or not result.stdout:
+        return []  # Silent video or unsupported audio: rely on visual signal.
+    data = result.stdout
+    scores = []
+    for offset in range(0, len(data), 16000):
+        chunk = data[offset:offset+16000]
+        count = len(chunk)//2
+        if count < 800: break
+        values = struct.unpack(f"<{count}h", chunk[:count*2])
+        rms = math.sqrt(sum(v*v for v in values)/count) / 32768
+        scores.append(rms)
+    return scores
+
+
+def _visual_changes(path: Path, duration: float) -> list[float]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(503, "FFmpeg is not installed.")
+    # 64x36 grayscale @ 1 fps, capped at 30 minutes. Fast, low-memory frames.
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-t", str(min(duration, 1800)), "-vf", "fps=1,scale=64:36,format=gray",
+           "-an", "-f", "rawvideo", "pipe:1"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(422, "Visual analysis timed out.")
+    if result.returncode != 0:
+        raise HTTPException(422, "Could not decode video frames for analysis.")
+    size = 64*36
+    frames = [result.stdout[i:i+size] for i in range(0, len(result.stdout)-size+1, size)]
+    scores = [0.0]
+    for previous, current in zip(frames, frames[1:]):
+        scores.append(sum(abs(a-b) for a,b in zip(previous,current))/(size*255))
+    return scores
+
+
+def _normalize(values: list[float]) -> list[float]:
+    if not values: return []
+    baseline = statistics.median(values)
+    upper = max(values)
+    if upper <= baseline + 1e-8: return [0.0] * len(values)
+    return [max(0.0, min(1.0, (value-baseline)/(upper-baseline))) for value in values]
+
+
+@app.post("/projects/{project_id}/analyze")
+def analyze_project(project_id: str):
+    with connect_db() as db:
+        row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Project not found.")
+    if row["source_type"] != "local_file":
+        raise HTTPException(400, "Upload an authorized local video before analyzing highlights.")
+    path = Path(row["source_path"] or "").resolve()
+    try:
+        path.relative_to(SOURCES_DIR)
+    except ValueError:
+        raise HTTPException(400, "Invalid project video path.")
+    if not path.is_file():
+        raise HTTPException(404, "The local source video is missing.")
+    duration = float(row["duration_seconds"] or 0)
+    if duration < 3:
+        raise HTTPException(422, "Video must be at least 3 seconds long.")
+    audio = _normalize(_decode_audio(path, duration))
+    visual = _normalize(_visual_changes(path, duration))
+    length = min(math.ceil(duration), 1800, max(len(audio),len(visual)))
+    candidates = []
+    for second in range(2, max(2, length-2)):
+        a = audio[second] if second < len(audio) else 0.0
+        v = visual[second] if second < len(visual) else 0.0
+        score = round(0.65*a + 0.35*v, 4) if audio else round(v, 4)
+        candidates.append((score, second, a, v))
+    candidates.sort(reverse=True)
+    selected = []
+    for score, second, a, v in candidates:
+        if score < 0.12 or any(abs(second - item[1]) < 18 for item in selected):
+            continue
+        selected.append((score, second, a, v))
+        if len(selected) >= 8: break
+    selected.sort(key=lambda item: item[1])
+    highlights = []
+    for score, second, a, v in selected:
+        start = max(0.0, float(second)-9)
+        end = min(duration, float(second)+12)
+        highlights.append({"id": str(uuid.uuid4()), "project_id": project_id,
+            "start_seconds": start, "end_seconds": end, "peak_seconds": float(second),
+            "score": score, "audio_score": round(a,4), "visual_score": round(v,4),
+            "reason": "Audio intensity + visual change" if audio else "Visual change (no audio signal)"})
+    with connect_db() as db:
+        db.execute("DELETE FROM highlights WHERE project_id=?", (project_id,))
+        db.executemany("""INSERT INTO highlights (id, project_id, start_seconds, end_seconds,
+            peak_seconds, score, audio_score, visual_score, reason)
+            VALUES (:id,:project_id,:start_seconds,:end_seconds,:peak_seconds,:score,:audio_score,:visual_score,:reason)""", highlights)
+        db.execute("UPDATE projects SET status='analyzed' WHERE id=?", (project_id,))
+        db.commit()
+    return {"project_id": project_id, "highlights": highlights,
+            "method": "Local audio-energy and frame-change heuristics; not goal recognition.",
+            "analyzed_seconds": min(duration, 1800)}
+
+
+@app.get("/projects/{project_id}/highlights")
+def project_highlights(project_id: str):
+    with connect_db() as db:
+        if db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None:
+            raise HTTPException(404, "Project not found.")
+        rows = db.execute("SELECT * FROM highlights WHERE project_id=? ORDER BY start_seconds", (project_id,)).fetchall()
+    return {"highlights": [dict(row) for row in rows]}
+
+
+@app.post("/projects/{project_id}/highlights/{highlight_id}/render")
+def render_highlight(project_id: str, highlight_id: str):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(503, "FFmpeg was not found. Restart VS Code after installing it.")
+    with connect_db() as db:
+        project = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        highlight = db.execute("SELECT * FROM highlights WHERE id=? AND project_id=?", (highlight_id, project_id)).fetchone()
+    if project is None or highlight is None:
+        raise HTTPException(404, "Project or highlight not found.")
+    if project["source_type"] != "local_file":
+        raise HTTPException(400, "Upload an authorized local video before rendering clips.")
+    source = Path(project["source_path"] or "").resolve()
+    try:
+        source.relative_to(SOURCES_DIR)
+    except ValueError:
+        raise HTTPException(400, "Invalid source video path.")
+    if not source.is_file():
+        raise HTTPException(404, "Source video file is missing.")
+    start = max(0.0, float(highlight["start_seconds"]))
+    duration = max(1.0, min(90.0, float(highlight["end_seconds"]) - start))
+    clip_id = str(uuid.uuid4())
+    output = (CLIPS_DIR / f"{clip_id}.mp4").resolve()
+    # Center-crop to vertical 9:16. Smart player/ball tracking is a later improvement.
+    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1"
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", str(source),
+               "-t", f"{duration:.3f}", "-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", "22",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=900, check=False)
+    except subprocess.TimeoutExpired:
+        output.unlink(missing_ok=True)
+        raise HTTPException(422, "Clip rendering timed out after 15 minutes.")
+    if result.returncode != 0 or not output.is_file():
+        output.unlink(missing_ok=True)
+        raise HTTPException(422, "FFmpeg could not render the clip: " + (result.stderr[-600:] if result.stderr else "unknown error"))
+    record = {"id": clip_id, "project_id": project_id, "highlight_id": highlight_id, "file_path": str(output),
+              "created_at": datetime.now(timezone.utc).isoformat(), "start_seconds": start, "end_seconds": start+duration}
+    with connect_db() as db:
+        db.execute("INSERT INTO clips (id,project_id,highlight_id,file_path,created_at,start_seconds,end_seconds) VALUES (:id,:project_id,:highlight_id,:file_path,:created_at,:start_seconds,:end_seconds)", record)
+        db.commit()
+    return {"clip": {"id": clip_id, "project_id": project_id, "highlight_id": highlight_id,
+            "created_at": record["created_at"], "start_seconds": start, "end_seconds": start+duration,
+            "width": 1080, "height": 1920, "file_url": f"/api/clips/{clip_id}/file"}}
+
+
+@app.get("/clips/{clip_id}/file")
+def get_clip_file(clip_id: str):
+    with connect_db() as db:
+        row = db.execute("SELECT * FROM clips WHERE id=?", (clip_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Clip not found.")
+    file_path = Path(row["file_path"]).resolve()
+    try:
+        file_path.relative_to(CLIPS_DIR)
+    except ValueError:
+        raise HTTPException(400, "Invalid clip path.")
+    if not file_path.is_file():
+        raise HTTPException(404, "Rendered clip file is missing.")
+    return FileResponse(file_path, media_type="video/mp4", filename=f"gaming-short-{clip_id[:8]}.mp4")
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host=os.getenv("WORKER_HOST", "127.0.0.1"), port=int(os.getenv("WORKER_PORT", "8001")), reload=False)

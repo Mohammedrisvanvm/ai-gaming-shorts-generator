@@ -1,0 +1,15 @@
+@"
+node_modules/
+.next/
+.venv/
+__pycache__/
+.env
+.env.*
+!.env.example
+data/sources/*
+data/clips/*
+data/shorts.db
+logs/
+dist/
+build/
+"@ | Set-Content .gitignore

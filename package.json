@@ -1,0 +1,10 @@
+{
+  "name": "ai-gaming-shorts",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.12.1",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @shorts/web --filter @shorts/api dev",
+    "typecheck": "pnpm --recursive typecheck"
+  }
+}
